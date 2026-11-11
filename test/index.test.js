@@ -579,6 +579,9 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
           assert.match(request.messages[0].content, /"আমার X ফাইলটা পাঠাও".*call send_file/);
           assert.match(request.messages[0].content, /"মনে রাখো".*call save_rule/);
           assert.match(request.messages[0].content, /Use youtube_action for actions on the currently open YouTube video/);
+          assert.match(request.messages[0].content, /"ফুল স্কিন করো".*"fullscreen_on"/);
+          assert.match(request.messages[0].content, /"ফুল স্কিন অফ করো".*"fullscreen_off"/);
+          assert.match(request.messages[0].content, /"লাইক তুলে নাও".*"unlike"/);
           assert.match(request.messages[0].content, /ইউটিউব ট্যাব close করে দাও/);
           return {
             choices: [{

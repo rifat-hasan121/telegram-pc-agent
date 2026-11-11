@@ -5,7 +5,18 @@ const SIGN_IN_MESSAGE = 'YouTube-এ Like বা comment করার জন্�
 
 function createYoutubeController({ browserType = chromium } = {}) {
   async function youtubeAction(action, text) {
-    const supportedActions = ['fullscreen', 'play_pause', 'next', 'mute', 'skip_ad', 'like', 'comment'];
+    const supportedActions = [
+      'fullscreen',
+      'fullscreen_on',
+      'fullscreen_off',
+      'play_pause',
+      'next',
+      'mute',
+      'skip_ad',
+      'like',
+      'unlike',
+      'comment'
+    ];
     if (!supportedActions.includes(action)) {
       throw new Error('Unsupported YouTube action.');
     }
@@ -29,14 +40,31 @@ function createYoutubeController({ browserType = chromium } = {}) {
         return 'চালু থাকা YouTube watch tab পাওয়া যায়নি। আগে Chrome-এ একটি YouTube ভিডিও খুলুন।';
       }
 
-      if (action === 'fullscreen') {
-        const button = page.locator('.ytp-fullscreen-button');
-        if (await button.isVisible().catch(() => false)) {
-          await button.click();
-        } else {
-          await page.keyboard.press('f');
+      if (action === 'fullscreen' || action === 'fullscreen_on') {
+        const isFs = await page.evaluate(() => !!document.fullscreenElement);
+        if (!isFs) {
+          await page.hover('#movie_player');
+          await page.click('.ytp-fullscreen-button');
         }
         return 'YouTube ভিডিওটি fullscreen করা হয়েছে।';
+      }
+
+      if (action === 'fullscreen_off') {
+        const isFs = await page.evaluate(() => !!document.fullscreenElement);
+        if (isFs) {
+          try {
+            await page.evaluate(() => document.exitFullscreen());
+          } catch (error) {
+            console.error('YouTube fullscreen exit failed:', error.message);
+          }
+          const stillFullscreen = await page.evaluate(() => !!document.fullscreenElement);
+          if (stillFullscreen) {
+            await page.keyboard.press('Escape');
+            await page.hover('#movie_player');
+            await page.click('.ytp-fullscreen-button');
+          }
+        }
+        return 'YouTube ভিডিওর fullscreen বন্ধ করা হয়েছে।';
       }
 
       if (action === 'play_pause') {
@@ -63,7 +91,7 @@ function createYoutubeController({ browserType = chromium } = {}) {
         return 'YouTube বিজ্ঞাপনটি skip করা হয়েছে।';
       }
 
-      if (action === 'like') {
+      if (action === 'like' || action === 'unlike') {
         const avatar = page.locator('#avatar-btn');
         if (!(await avatar.isVisible().catch(() => false))) {
           return SIGN_IN_MESSAGE;
@@ -74,10 +102,17 @@ function createYoutubeController({ browserType = chromium } = {}) {
         if (!(await likeButton.isVisible())) {
           return 'YouTube Like buttonটি খুঁজে পাওয়া যায়নি।';
         }
+        const isLiked = await likeButton.getAttribute('aria-pressed') === 'true';
+        if (action === 'like' && isLiked) {
+          return 'ভিডিওটিতে আগে থেকেই Like দেওয়া আছে।';
+        }
+        if (action === 'unlike' && !isLiked) {
+          return 'ভিডিওটিতে এখনো Like দেওয়া হয়নি।';
+        }
         try {
           await likeButton.click();
         } catch (error) {
-          console.error('YouTube Like click failed:', error.message);
+          console.error(`YouTube ${action === 'like' ? 'Like' : 'Unlike'} click failed:`, error.message);
           throw error;
         }
         const signInPopup = page.locator(
@@ -86,7 +121,9 @@ function createYoutubeController({ browserType = chromium } = {}) {
         if (await signInPopup.isVisible().catch(() => false)) {
           return SIGN_IN_MESSAGE;
         }
-        return 'YouTube ভিডিওতে Like দেওয়া হয়েছে।';
+        return action === 'like'
+          ? 'YouTube ভিডিওতে Like দেওয়া হয়েছে।'
+          : 'YouTube ভিডিও থেকে Like সরানো হয়েছে।';
       }
 
       const avatar = page.locator('#avatar-btn');
