@@ -90,6 +90,83 @@ test('openUrl launches Chrome with an isolated profile if CDP is unavailable', a
   assert.equal(reply, 'Chrome চালু করে পেজটি খোলা হয়েছে।');
 });
 
+test('openYoutubeUrl navigates an existing YouTube tab instead of creating another', async () => {
+  const calls = [];
+  const tabs = [
+    { type: 'page', id: 'tab-1', title: 'Search', url: 'https://google.com' },
+    { type: 'page', id: 'youtube-tab', title: 'YouTube', url: 'https://www.youtube.com/watch?v=old' }
+  ];
+  const page = {
+    url: () => 'https://www.youtube.com/watch?v=old',
+    goto: async (...args) => calls.push(['goto', ...args])
+  };
+  const browser = {
+    contexts: () => [{ pages: () => [page] }],
+    close: async () => calls.push(['disconnect'])
+  };
+  const controller = createChromeController({
+    fetchImpl: async (url) => {
+      calls.push(['fetch', url]);
+      return jsonResponse(tabs);
+    },
+    browserType: {
+      connectOverCDP: async (url) => {
+        calls.push(['connectOverCDP', url]);
+        return browser;
+      }
+    }
+  });
+  const target = 'https://www.youtube.com/watch?v=new';
+
+  const reply = await controller.openYoutubeUrl(target);
+
+  assert.deepEqual(calls, [
+    ['fetch', `${CDP_BASE_URL}/json`],
+    ['connectOverCDP', CDP_BASE_URL],
+    ['goto', target, { waitUntil: 'domcontentloaded', timeout: 15000 }],
+    ['disconnect']
+  ]);
+  assert.equal(reply, 'আগের YouTube ট্যাবেই ভিডিওটি খোলা হয়েছে।');
+});
+
+test('openYoutubeUrl opens a new tab only when no YouTube tab is listed', async () => {
+  const calls = [];
+  const controller = createChromeController({
+    fetchImpl: async (url, options = {}) => {
+      calls.push([url, options.method || 'GET']);
+      return url.endsWith('/json')
+        ? jsonResponse([{ type: 'page', id: 'tab-1', url: 'https://google.com' }])
+        : jsonResponse({ id: 'new-tab' });
+    },
+    browserType: {
+      connectOverCDP: async () => assert.fail('Must not connect to a YouTube tab')
+    }
+  });
+  const target = 'https://www.youtube.com/watch?v=new';
+
+  const reply = await controller.openYoutubeUrl(target);
+
+  assert.deepEqual(calls, [
+    [`${CDP_BASE_URL}/json`, 'GET'],
+    [`${CDP_BASE_URL}/json`, 'GET'],
+    [`${CDP_BASE_URL}/json/new?${encodeURIComponent(target)}`, 'PUT']
+  ]);
+  assert.equal(reply, 'Chrome-এ নতুন ট্যাব খোলা হয়েছে।');
+});
+
+test('openYoutubeUrl launches Chrome when CDP is unavailable', async () => {
+  const calls = [];
+  const controller = createChromeController({
+    fetchImpl: async () => { throw new TypeError('fetch failed'); },
+    launch: async (url) => calls.push(['launch', url])
+  });
+
+  const reply = await controller.openYoutubeUrl('https://www.youtube.com/watch?v=new');
+
+  assert.deepEqual(calls, [['launch', 'https://www.youtube.com/watch?v=new']]);
+  assert.equal(reply, 'Chrome চালু করে পেজটি খোলা হয়েছে।');
+});
+
 test('openUrl logs a failed CDP new-tab request and falls back to xdg-open', async () => {
   const calls = [];
   const originalError = console.error;

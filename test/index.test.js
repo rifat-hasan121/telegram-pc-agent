@@ -6,6 +6,7 @@ const {
   handleTextCommand,
   loadConfig,
   logProcessingError,
+  readUserRules,
   sendTelegramReply,
   shellQuote
 } = require('../index');
@@ -30,8 +31,8 @@ test('play_youtube searches and opens the first video result, returning its exac
     },
     undefined,
     undefined,
-    { openUrl: async (url) => {
-      calls.push(['openUrl', url]);
+    { openYoutubeUrl: async (url) => {
+      calls.push(['openYoutubeUrl', url]);
       return 'Chrome-এ নতুন ট্যাব খোলা হয়েছে।';
     } }
   );
@@ -39,7 +40,7 @@ test('play_youtube searches and opens the first video result, returning its exac
   const result = await handlers.play_youtube({ query: 'cats & dogs' });
 
   assert.deepEqual(searches, ['cats & dogs']);
-  assert.deepEqual(calls[0], ['openUrl', 'https://www.youtube.com/watch?v=first']);
+  assert.deepEqual(calls[0], ['openYoutubeUrl', 'https://www.youtube.com/watch?v=first']);
   assert.equal(result, 'YouTube-এ “First exact video title” চালানো হচ্ছে। Chrome-এ নতুন ট্যাব খোলা হয়েছে।');
 });
 
@@ -215,7 +216,7 @@ test('play_youtube logs browser opening errors and rethrows them for Telegram', 
       }),
       undefined,
       undefined,
-      { openUrl: async () => { throw new Error('Chrome could not open tab'); } }
+      { openYoutubeUrl: async () => { throw new Error('Chrome could not open tab'); } }
     );
 
     await assert.rejects(handlers.play_youtube({ query: 'music' }), /Chrome could not open tab/);
@@ -448,6 +449,46 @@ test('send_file resolves home paths, sends existing files, and reports missing p
   assert.equal(calls.length, 1);
 });
 
+test('save_rule appends a normalized rule to rules.txt', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {
+      appendFileSync: (...args) => calls.push(args)
+    },
+    undefined,
+    undefined,
+    '/project/rules.txt'
+  );
+
+  const reply = await handlers.save_rule({ rule: 'Always reply in Bengali\nand be concise' });
+
+  assert.deepEqual(calls, [['/project/rules.txt', '- Always reply in Bengali and be concise\n', 'utf8']]);
+  assert.equal(reply, 'নিয়মটি ভবিষ্যতের জন্য সংরক্ষণ করা হয়েছে।');
+  await assert.rejects(handlers.save_rule({ rule: '  ' }), /Invalid rule/);
+  await assert.rejects(handlers.save_rule({ rule: 'x'.repeat(1001) }), /Invalid rule/);
+});
+
+test('readUserRules reads existing memory and returns empty text when no rules file exists', () => {
+  const calls = [];
+  const fileSystem = {
+    existsSync: (filePath) => filePath === '/project/rules.txt',
+    readFileSync: (...args) => {
+      calls.push(args);
+      return '- Reply in Bengali\n- Keep answers short\n';
+    }
+  };
+
+  assert.equal(readUserRules('/project/rules.txt', fileSystem), '- Reply in Bengali\n- Keep answers short');
+  assert.deepEqual(calls, [['/project/rules.txt', 'utf8']]);
+  assert.equal(readUserRules('/project/missing.txt', fileSystem), '');
+});
+
 test('loadConfig requires the three configured values and a numeric user id', () => {
   assert.deepEqual(loadConfig({
     TELEGRAM_BOT_TOKEN: 'telegram-token',
@@ -494,7 +535,7 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
         create: async (request) => {
           assert.equal(request.model, 'google/gemini-2.5-flash');
           assert.equal(request.max_tokens, 1000);
-          assert.equal(request.tools.length, 10);
+          assert.equal(request.tools.length, 11);
           assert.equal(request.messages[0].role, 'system');
           assert.match(request.messages[0].content, /both Bengali and English/);
           assert.match(request.messages[0].content, /do not ask any clarifying questions/);
@@ -505,6 +546,7 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
           assert.match(request.messages[0].content, /never request arbitrary shell commands/);
           assert.match(request.messages[0].content, /"স্ক্রিনশট পাঠাও".*call take_screenshot/);
           assert.match(request.messages[0].content, /"আমার X ফাইলটা পাঠাও".*call send_file/);
+          assert.match(request.messages[0].content, /"মনে রাখো".*call save_rule/);
           assert.match(request.messages[0].content, /ইউটিউব ট্যাব close করে দাও/);
           return {
             choices: [{
@@ -574,25 +616,36 @@ test('handleTextCommand passes diagnostic stdout and stderr to the model for Ben
 });
 
 test('handleTextCommand returns a direct AI answer without executing a tool', async () => {
+  let systemPrompt;
   const openai = {
     chat: {
       completions: {
-        create: async () => ({
-          choices: [{
-            message: {
-              content: 'এখানে কয়েকটি জনপ্রিয় গানের নাম দেওয়া হলো।',
-              tool_calls: []
-            }
-          }]
-        })
+        create: async (request) => {
+          systemPrompt = request.messages[0].content;
+          return {
+            choices: [{
+              message: {
+                content: 'এখানে কয়েকটি জনপ্রিয় গানের নাম দেওয়া হলো।',
+                tool_calls: []
+              }
+            }]
+          };
+        }
       }
     }
   };
   const calls = [];
   const handlers = createActionHandlers(async (command) => calls.push(command));
 
-  const reply = await handleTextCommand(openai, 'কি গান আছে তার ১০টা লিস্ট দাও', handlers);
+  const reply = await handleTextCommand(
+    openai,
+    'কি গান আছে তার ১০টা লিস্ট দাও',
+    handlers,
+    '- উত্তর সবসময় বাংলায় দেবে।'
+  );
 
   assert.equal(reply, 'এখানে কয়েকটি জনপ্রিয় গানের নাম দেওয়া হলো।');
+  assert.match(systemPrompt, /## User Rules & Preferences\n- উত্তর সবসময় বাংলায় দেবে।/);
+  assert.match(systemPrompt, /cannot override security requirements/);
   assert.deepEqual(calls, []);
 });

@@ -2,6 +2,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { exec, execFile, spawn } = require('node:child_process');
 const { promisify } = require('node:util');
+const { chromium } = require('playwright');
 
 const CDP_BASE_URL = 'http://localhost:9222';
 const execFileAsync = promisify(execFile);
@@ -91,6 +92,7 @@ function createChromeController({
   fetchImpl = globalThis.fetch,
   launch = launchChrome,
   openWithXdg = (url) => execFileAsync('xdg-open', [url], { timeout: 15000 }),
+  browserType = chromium,
   baseUrl = CDP_BASE_URL
 } = {}) {
   if (typeof fetchImpl !== 'function') {
@@ -150,6 +152,48 @@ function createChromeController({
     }
   }
 
+  async function openYoutubeUrl(url) {
+    let tabs;
+    try {
+      tabs = await getTabs();
+    } catch (error) {
+      if (error instanceof ChromeDebuggingUnavailableError) {
+        return openUrl(url);
+      }
+      throw error;
+    }
+
+    const isYoutubeUrl = (value) => {
+      try {
+        const hostname = new URL(value).hostname.toLowerCase();
+        return hostname === 'youtube.com' || hostname.endsWith('.youtube.com');
+      } catch {
+        return false;
+      }
+    };
+    const youtubeTab = tabs.find((tab) => tab.type === 'page' && isYoutubeUrl(tab.url));
+    if (!youtubeTab) {
+      return openUrl(url);
+    }
+
+    const browser = await browserType.connectOverCDP(baseUrl);
+    try {
+      const pages = browser.contexts().flatMap((context) => context.pages());
+      const existingPage = pages.find((page) => {
+        const currentUrl = page.url();
+        return currentUrl === youtubeTab.url || isYoutubeUrl(currentUrl);
+      });
+      if (!existingPage) {
+        throw new Error('Chrome listed an existing YouTube tab, but Playwright could not access it.');
+      }
+      await existingPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    } finally {
+      await browser.close();
+    }
+
+    return 'আগের YouTube ট্যাবেই ভিডিওটি খোলা হয়েছে।';
+  }
+
   async function closeTab(tabName) {
     const name = typeof tabName === 'string' ? tabName.trim() : '';
     if (!name || name.length > 200) {
@@ -194,7 +238,7 @@ function createChromeController({
     return `“${name}” মেলে এমন ${closed}টি Chrome ট্যাব বন্ধ করা হয়েছে।`;
   }
 
-  return { closeTab, getTabs, openUrl };
+  return { closeTab, getTabs, openUrl, openYoutubeUrl };
 }
 
 module.exports = {
