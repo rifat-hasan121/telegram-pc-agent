@@ -43,8 +43,9 @@ Transient OpenRouter and Telegram connection failures are retried up to three ti
 - “Open [URL]” opens an HTTP or HTTPS URL in a new Chrome tab.
 - “Close the [site] tab” (for example YouTube or Facebook) closes matching Chrome tabs by title or URL and confirms the count in Bengali.
 - “Lock the screen” runs `xdg-screensaver lock`.
+- “পিসি বন্ধ করো” / “shutdown pc” and “পিসি রিস্টার্ট করো” / “restart pc” ask for explicit confirmation with Telegram buttons. The confirmation expires after 30 seconds; only confirming runs the corresponding fixed `systemctl poweroff` or `systemctl reboot` action after a 1.5-second delay.
 - Remote PC unlock is optional and uses the static `UNLOCK_PASSCODE` value in `.env`. Send “unlock pc” or “পিসি আনলক করো”, then send the passcode as the next message within 60 seconds. Use a long, unique passphrase and never reuse your Ubuntu password. The bot intercepts the exchange before AI processing and attempts to delete the passcode, prompt, and trigger messages before checking; these messages are never sent to OpenRouter. Deletion is best-effort and does not prevent Telegram from processing a message or showing notifications. Static passcodes are less secure than TOTP if exposed; protect `.env`, your Telegram account, and the bot token. Leave `UNLOCK_PASSCODE` empty to disable remote unlock.
-- To permit only these fixed unlock actions without a sudo password prompt, create a sudoers drop-in with `sudo visudo -f /etc/sudoers.d/telegram-pc-agent` and add `YOUR_LINUX_USER ALL=(root) NOPASSWD: /usr/bin/loginctl unlock-sessions, /usr/bin/loginctl unlock-session *`. Replace `YOUR_LINUX_USER` with the account running the bot. This grants that account permission to unlock sessions through the bot. If the unlock request cannot be deleted from Telegram, it is rejected.
+- To permit only the fixed unlock and power actions without a sudo password prompt, create a sudoers drop-in with `sudo visudo -f /etc/sudoers.d/telegram-pc-agent` and add `YOUR_LINUX_USER ALL=(root) NOPASSWD: /usr/bin/loginctl unlock-sessions, /usr/bin/loginctl unlock-session *, /usr/bin/systemctl poweroff, /usr/bin/systemctl reboot`. Replace `YOUR_LINUX_USER` with the account running the bot. This grants that account permission to unlock sessions, shut down, and restart through the bot. If the unlock request cannot be deleted from Telegram, it is rejected.
 - “Mute/unmute volume” runs `amixer set Master toggle`.
 - “Set volume to [0–100]%” or “increase/decrease volume by [0–100]%” uses fixed `pactl` arguments and replies with the resulting level in Bengali. Relative changes are clamped to 0–100%.
 - Ask which applications are running for a Bengali summary of the top active processes, or request system stats for CPU, RAM, battery, and disk. These use fixed, read-only `run_bash` diagnostic actions and return command output to the AI for summarization.
@@ -68,3 +69,66 @@ npx playwright install chromium
 ```
 
 Run the tests with `npm test`.
+
+
+# 🤖 Telegram PC Agent
+
+উবুন্টু পিসিকে (Wayland) টেলিগ্রাম বটের মাধ্যমে রিমোটলি কন্ট্রোল করার জন্য একটি Node.js অটোমেশন এজেন্ট।
+
+## ✨ প্রধান ফিচারসমূহ
+* **🎬 YouTube কন্ট্রোল:** ভিডিও প্লে/পজ, ফরোয়ার্ড/রিওয়াইন্ড, থিয়েটার মোড, ফুলস্ক্রিন অন/অফ এবং লাইক/আনলাইক।
+* **🔓 রিমোট স্ক্রিন আনলক:** ২-ধাপের নিরাপদ ভেরিফিকেশন (`UNLOCK_PASSCODE`) এবং অটো-ডিলিট মেসেজ সাপোর্ট।
+* **⚡ পাওয়ার ম্যানেজমেন্ট:** ৩০ সেকেন্ডের কনফার্মেশন বাটনসহ পিসি শাটডাউন ও রিস্টার্ট।
+* **🔄 অটো-স্টার্ট:** `systemd` ইউজার সার্ভিসের মাধ্যমে পিসি অন হওয়ার সাথে সাথেই ব্যাকগ্রাউন্ডে চালু থাকা।
+
+---
+
+## ⚙️ সেটআপ ও পারমিশন
+
+### ১. এনভায়রনমেন্ট ভেরিয়েবল (`.env`)
+প্রজেক্টের রুটে `.env` ফাইলে আপনার টোকেন ও রিমোট আনলক পাসকোড সেট করুন:
+```env
+UNLOCK_PASSCODE=your_passcode_here
+```
+
+### ২. `sudoers` পারমিশন (পাসওয়ার্ড ছাড়া কমান্ড চালানোর জন্য)
+টার্মিনালে নিচের কমান্ডগুলো চালিয়ে রিমোট আনলক এবং পাওয়ার কন্ট্রোলের পারমিশন দিন:
+```bash
+echo "$USER ALL=(ALL) NOPASSWD: /usr/bin/loginctl unlock-sessions" | sudo tee /etc/sudoers.d/telegram-unlock
+echo "$USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl poweroff, /usr/bin/systemctl reboot" | sudo tee /etc/sudoers.d/telegram-power
+```
+
+---
+
+## 🛠️ Telegram Bot Service Management (`systemd`)
+
+পিসির ব্যাকগ্রাউন্ডে চলা টেলিগ্রাম বটটি কন্ট্রোল করার জন্য নিচের কমান্ডগুলো ব্যবহার করুন:
+
+### 📊 ১. বটের স্ট্যাটাস চেক করা
+বটটি বর্তমানে `active (running)` অবস্থায় আছে কি না তা দেখতে:
+```bash
+systemctl --user status telegram-bot.service
+```
+
+### 📜 ২. লাইভ লগ দেখা (Troubleshooting)
+কোনো এরর হচ্ছে কি না বা বটের লাইভ অ্যাক্টিভিটি দেখতে:
+```bash
+journalctl --user -u telegram-bot.service -f
+```
+*(লগ দেখা থেকে বের হতে `Ctrl + C` চাপুন)*
+
+### 🔄 ৩. বট রিস্টার্ট করা
+কোডে কোনো পরিবর্তন করার পর নতুন কোড লোড করতে:
+```bash
+systemctl --user restart telegram-bot.service
+```
+
+### 🛑 ৪. বট সাময়িকভাবে বন্ধ বা চালু করা
+* **বন্ধ করতে:**
+  ```bash
+  systemctl --user stop telegram-bot.service
+  ```
+* **চালু করতে:**
+  ```bash
+  systemctl --user start telegram-bot.service
+  ```

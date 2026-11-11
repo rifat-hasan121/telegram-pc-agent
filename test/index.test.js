@@ -5,6 +5,7 @@ const {
   createPollingErrorLogger,
   createPasscodeVerifier,
   beginPcUnlock,
+  handlePowerCallback,
   handlePendingUnlockMessage,
   isPcUnlockIntent,
   handleTextCommand,
@@ -183,6 +184,239 @@ test('unlock_pc runs non-interactive sudo and reports success', async () => {
     { stdio: ['ignore', 'pipe', 'pipe'] }
   ]]);
   assert.equal(result, 'পিসি আনলক করা হয়েছে।');
+});
+
+test('power_control creates an inline shutdown confirmation without running a command', async () => {
+  const calls = [];
+  const pendingPower = new Map();
+  const bot = {
+    sendMessage: async (...args) => {
+      calls.push(['sendMessage', ...args]);
+      return { message_id: 123 };
+    }
+  };
+  const handlers = createActionHandlers(
+    undefined, undefined, undefined, undefined, undefined,
+    { bot, chatId: 456, pendingPower }
+  );
+
+  const result = await handlers.power_control({ action: 'shutdown' });
+
+  assert.equal(result, null);
+  assert.deepEqual(calls, [
+    ['sendMessage', 456, 'আপনি কি নিশ্চিতভাবে পিসি বন্ধ করতে চান?', {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '✅ হ্যাঁ, নিশ্চিত', callback_data: 'power_confirm' },
+          { text: '❌ বাতিল', callback_data: 'power_cancel' }
+        ]]
+      }
+    }]
+  ]);
+  assert.equal(pendingPower.get(456).action, 'shutdown');
+  assert.equal(pendingPower.get(456).promptMsgId, 123);
+  clearTimeout(pendingPower.get(456).timeout);
+});
+
+test('power_control creates a restart confirmation prompt', async () => {
+  const calls = [];
+  const pendingPower = new Map();
+  const bot = {
+    sendMessage: async (...args) => {
+      calls.push(['sendMessage', ...args]);
+      return { message_id: 124 };
+    }
+  };
+  const handlers = createActionHandlers(
+    undefined, undefined, undefined, undefined, undefined,
+    { bot, chatId: 456, pendingPower }
+  );
+
+  await handlers.power_control({ action: 'restart' });
+
+  assert.equal(calls[0][1], 456);
+  assert.equal(calls[0][2], 'আপনি কি নিশ্চিতভাবে পিসি রিস্টার্ট করতে চান?');
+  assert.equal(pendingPower.get(456).action, 'restart');
+  clearTimeout(pendingPower.get(456).timeout);
+});
+
+test('power callback authorizes, confirms, edits, waits, then runs shutdown', async () => {
+  const calls = [];
+  const pendingPower = new Map();
+  const state = {
+    action: 'shutdown',
+    expiresAt: Date.now() + 30000,
+    promptMsgId: 123,
+    timeout: setTimeout(() => {}, 30000)
+  };
+  pendingPower.set(456, state);
+  const bot = {
+    answerCallbackQuery: async (...args) => calls.push(['answer', ...args]),
+    editMessageText: async (...args) => calls.push(['edit', ...args])
+  };
+
+  await handlePowerCallback({
+    bot,
+    query: {
+      id: 'callback-1',
+      from: { id: 789 },
+      data: 'power_confirm',
+      message: { message_id: 123, chat: { id: 456 } }
+    },
+    allowedUserId: '789',
+    pendingPower,
+    wait: async (milliseconds) => calls.push(['wait', milliseconds]),
+    runProgram: async (...args) => calls.push(['runProgram', ...args])
+  });
+
+  assert.equal(pendingPower.has(456), false);
+  assert.deepEqual(calls, [
+    ['answer', 'callback-1'],
+    ['edit', 'পিসি বন্ধ করা হচ্ছে...', {
+      chat_id: 456,
+      message_id: 123,
+      reply_markup: { inline_keyboard: [] }
+    }],
+    ['wait', 1500],
+    ['runProgram', '/usr/bin/sudo', ['-n', '/usr/bin/systemctl', 'poweroff'], { timeout: 10000 }]
+  ]);
+});
+
+test('power callback runs restart only after explicit confirmation', async () => {
+  const calls = [];
+  const pendingPower = new Map([[456, {
+    action: 'restart',
+    expiresAt: Date.now() + 30000,
+    promptMsgId: 124,
+    timeout: setTimeout(() => {}, 30000)
+  }]]);
+  const bot = {
+    answerCallbackQuery: async (...args) => calls.push(['answer', ...args]),
+    editMessageText: async (...args) => calls.push(['edit', ...args])
+  };
+  await handlePowerCallback({
+    bot,
+    query: {
+      id: 'callback-restart',
+      from: { id: 789 },
+      data: 'power_confirm',
+      message: { message_id: 124, chat: { id: 456 } }
+    },
+    allowedUserId: '789',
+    pendingPower,
+    wait: async (milliseconds) => calls.push(['wait', milliseconds]),
+    runProgram: async (...args) => calls.push(['runProgram', ...args])
+  });
+
+  assert.deepEqual(calls, [
+    ['answer', 'callback-restart'],
+    ['edit', 'পিসি রিস্টার্ট করা হচ্ছে...', {
+      chat_id: 456,
+      message_id: 124,
+      reply_markup: { inline_keyboard: [] }
+    }],
+    ['wait', 1500],
+    ['runProgram', '/usr/bin/sudo', ['-n', '/usr/bin/systemctl', 'reboot'], { timeout: 10000 }]
+  ]);
+});
+
+test('power callback cancellation clears state and does not run a command', async () => {
+  const calls = [];
+  const pendingPower = new Map([[456, {
+    action: 'restart',
+    expiresAt: Date.now() + 30000,
+    promptMsgId: 124,
+    timeout: setTimeout(() => {}, 30000)
+  }]]);
+  const bot = {
+    answerCallbackQuery: async (...args) => calls.push(['answer', ...args]),
+    editMessageText: async (...args) => calls.push(['edit', ...args])
+  };
+
+  await handlePowerCallback({
+    bot,
+    query: {
+      id: 'callback-2',
+      from: { id: 789 },
+      data: 'power_cancel',
+      message: { message_id: 124, chat: { id: 456 } }
+    },
+    allowedUserId: '789',
+    pendingPower
+  });
+
+  assert.equal(pendingPower.has(456), false);
+  assert.deepEqual(calls, [
+    ['answer', 'callback-2'],
+    ['edit', 'বাতিল করা হয়েছে।', {
+      chat_id: 456,
+      message_id: 124,
+      reply_markup: { inline_keyboard: [] }
+    }]
+  ]);
+});
+
+test('power callback ignores unauthorized users before touching pending state', async () => {
+  const calls = [];
+  const pendingPower = new Map([[456, {
+    action: 'shutdown',
+    expiresAt: Date.now() + 30000,
+    promptMsgId: 123,
+    timeout: setTimeout(() => {}, 30000)
+  }]]);
+  const handled = await handlePowerCallback({
+    bot: {
+      answerCallbackQuery: async (...args) => calls.push(args),
+      editMessageText: async (...args) => calls.push(args)
+    },
+    query: {
+      id: 'callback-3',
+      from: { id: 999 },
+      data: 'power_confirm',
+      message: { message_id: 123, chat: { id: 456 } }
+    },
+    allowedUserId: '789',
+    pendingPower
+  });
+  clearTimeout(pendingPower.get(456).timeout);
+  assert.equal(handled, false);
+  assert.equal(pendingPower.has(456), true);
+  assert.deepEqual(calls, []);
+});
+
+test('power callback expires stale confirmations without running a command', async () => {
+  const calls = [];
+  const pendingPower = new Map([[456, {
+    action: 'restart',
+    expiresAt: 1000,
+    promptMsgId: 124,
+    timeout: setTimeout(() => {}, 30000)
+  }]]);
+  const bot = {
+    answerCallbackQuery: async (...args) => calls.push(['answer', ...args]),
+    editMessageText: async (...args) => calls.push(['edit', ...args])
+  };
+  await handlePowerCallback({
+    bot,
+    query: {
+      id: 'callback-4',
+      from: { id: 789 },
+      data: 'power_confirm',
+      message: { message_id: 124, chat: { id: 456 } }
+    },
+    allowedUserId: '789',
+    pendingPower,
+    now: () => 1001
+  });
+  assert.equal(pendingPower.has(456), false);
+  assert.deepEqual(calls, [
+    ['answer', 'callback-4', { text: 'অনুরোধটির সময় শেষ হয়েছে।' }],
+    ['edit', 'অনুরোধটির সময় শেষ হয়েছে।', {
+      chat_id: 456,
+      message_id: 124,
+      reply_markup: { inline_keyboard: [] }
+    }]
+  ]);
 });
 
 test('unlock_pc does not run loginctl unlock-sessions without sudo', async () => {
@@ -826,7 +1060,9 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
         create: async (request) => {
           assert.equal(request.model, 'google/gemini-2.5-flash');
           assert.equal(request.max_tokens, 1000);
-          assert.equal(request.tools.length, 12);
+          assert.equal(request.tools.length, 13);
+          const powerTool = request.tools.find((tool) => tool.function.name === 'power_control');
+          assert.deepEqual(powerTool.function.parameters.properties.action.enum, ['shutdown', 'restart']);
           assert.equal(request.messages[0].role, 'system');
           assert.match(request.messages[0].content, /both Bengali and English/);
           assert.match(request.messages[0].content, /do not ask any clarifying questions/);
@@ -843,6 +1079,9 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
           assert.match(request.messages[0].content, /"ফুল স্কিন অফ করো".*"fullscreen_off"/);
           assert.match(request.messages[0].content, /"লাইক তুলে নাও".*"unlike"/);
           assert.match(request.messages[0].content, /Never ask for or process an Ubuntu password or PC unlock passcode/);
+          assert.match(request.messages[0].content, /"পিসি বন্ধ করো".*"shutdown"/);
+          assert.match(request.messages[0].content, /"পিসি রিস্টার্ট করো".*"restart"/);
+          assert.match(request.messages[0].content, /authorized user presses the confirmation button/);
           assert.match(request.messages[0].content, /ইউটিউব ট্যাব close করে দাও/);
           return {
             choices: [{
