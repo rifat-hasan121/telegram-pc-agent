@@ -38,6 +38,7 @@ Transient OpenRouter and Telegram connection failures are retried up to three ti
 ## Supported actions
 
 - “Play [query] on YouTube” searches YouTube and opens the first video result in Chrome, replying with its title.
+- “Like this video”, “skip the ad”, “pause/play”, “fullscreen”, “next video”, or “comment [text]” uses `youtube_action` on the currently open YouTube watch tab. You must be signed into YouTube in the bot’s Chrome profile for likes and comments.
 - “Open [URL]” opens an HTTP or HTTPS URL in a new Chrome tab.
 - “Close the [site] tab” (for example YouTube or Facebook) closes matching Chrome tabs by title or URL and confirms the count in Bengali.
 - “Lock the screen” runs `xdg-screensaver lock`.

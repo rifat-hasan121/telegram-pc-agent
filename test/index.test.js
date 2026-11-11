@@ -61,6 +61,37 @@ test('play_youtube reports an empty search result without opening a browser', as
   }
 });
 
+test('youtube_action delegates the action and optional comment text', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {
+      youtubeAction: async (...args) => {
+        calls.push(args);
+        return 'YouTube ভিডিওটি pause করা হয়েছে।';
+      }
+    }
+  );
+
+  const reply = await handlers.youtube_action({ action: 'play_pause' });
+  await handlers.youtube_action({ action: 'comment', text: 'Great video!' });
+
+  assert.deepEqual(calls, [
+    ['play_pause', undefined],
+    ['comment', 'Great video!']
+  ]);
+  assert.equal(reply, 'YouTube ভিডিওটি pause করা হয়েছে।');
+});
+
 test('browse_and_act passes the URL and goal to the browser agent', async () => {
   const calls = [];
   const handlers = createActionHandlers(
@@ -535,7 +566,7 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
         create: async (request) => {
           assert.equal(request.model, 'google/gemini-2.5-flash');
           assert.equal(request.max_tokens, 1000);
-          assert.equal(request.tools.length, 11);
+          assert.equal(request.tools.length, 12);
           assert.equal(request.messages[0].role, 'system');
           assert.match(request.messages[0].content, /both Bengali and English/);
           assert.match(request.messages[0].content, /do not ask any clarifying questions/);
@@ -547,6 +578,7 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
           assert.match(request.messages[0].content, /"স্ক্রিনশট পাঠাও".*call take_screenshot/);
           assert.match(request.messages[0].content, /"আমার X ফাইলটা পাঠাও".*call send_file/);
           assert.match(request.messages[0].content, /"মনে রাখো".*call save_rule/);
+          assert.match(request.messages[0].content, /Use youtube_action for actions on the currently open YouTube video/);
           assert.match(request.messages[0].content, /ইউটিউব ট্যাব close করে দাও/);
           return {
             choices: [{
