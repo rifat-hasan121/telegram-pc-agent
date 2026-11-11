@@ -3,6 +3,10 @@ const assert = require('node:assert/strict');
 const {
   createActionHandlers,
   createPollingErrorLogger,
+  createPasscodeVerifier,
+  beginPcUnlock,
+  handlePendingUnlockMessage,
+  isPcUnlockIntent,
   handleTextCommand,
   loadConfig,
   logProcessingError,
@@ -13,6 +17,255 @@ const {
 
 test('shellQuote safely escapes single quotes for shell commands', () => {
   assert.equal(shellQuote("it's"), "'it'\\''s'");
+});
+
+test('static unlock passcode accepts a match and rate-limits incorrect attempts', () => {
+  let timestamp = 1000;
+  const verifier = createPasscodeVerifier('long-random-passcode', {
+    now: () => timestamp,
+    maxAttempts: 2
+  });
+
+  assert.equal(verifier.verify('incorrect'), 'invalid');
+  assert.equal(verifier.verify('incorrect'), 'invalid');
+  assert.equal(verifier.verify('long-random-passcode'), 'rate_limited');
+  timestamp += 5 * 60 * 1000;
+  assert.equal(verifier.verify('long-random-passcode'), 'accepted');
+});
+
+test('PC unlock intent supports Bengali and English', () => {
+  assert.equal(isPcUnlockIntent('unlock pc long-random-passcode'), true);
+  assert.equal(isPcUnlockIntent('পিসি আনলক করো পাসওয়ার্ড long-random-passcode'), true);
+  assert.equal(isPcUnlockIntent('UNLOCK PC'), true);
+});
+
+test('unlock trigger sends prompt and stores both source message IDs per chat', async () => {
+  const calls = [];
+  const pendingUnlock = new Map();
+  const bot = {
+    sendMessage: async (...args) => {
+      calls.push(['sendMessage', ...args]);
+      return { message_id: 90 };
+    }
+  };
+
+  await beginPcUnlock({
+    bot,
+    msg: { chat: { id: 456 }, message_id: 9, text: 'unlock pc' },
+    pendingUnlock
+  });
+
+  assert.deepEqual(calls, [['sendMessage', 456, 'পিসি আনলক করতে পাসকোড দিন:']]);
+  assert.equal(pendingUnlock.get(456).promptMsgId, 90);
+  assert.equal(pendingUnlock.get(456).requestMsgId, 9);
+  clearTimeout(pendingUnlock.get(456).timeout);
+});
+
+test('correct passcode deletes all three messages before local unlock', async () => {
+  const calls = [];
+  const pendingUnlock = new Map([[456, {
+    promptMsgId: 90,
+    requestMsgId: 9,
+    timeout: setTimeout(() => {}, 60000)
+  }]]);
+  const bot = {
+    deleteMessage: async (...args) => calls.push(['deleteMessage', ...args]),
+    sendMessage: async (...args) => {
+      calls.push(['sendMessage', ...args]);
+      return { message_id: 91 };
+    }
+  };
+  const handled = await handlePendingUnlockMessage({
+    bot,
+    msg: { chat: { id: 456 }, message_id: 100, text: ' long-random-passcode ' },
+    pendingUnlock,
+    verifier: createPasscodeVerifier('long-random-passcode'),
+    unlockPc: async () => {
+      calls.push(['unlock']);
+      return 'পিসি আনলক করা হয়েছে।';
+    }
+  });
+
+  assert.equal(handled, true);
+  assert.equal(pendingUnlock.has(456), false);
+  assert.deepEqual(calls, [
+    ['deleteMessage', 456, 100],
+    ['deleteMessage', 456, 90],
+    ['deleteMessage', 456, 9],
+    ['unlock'],
+    ['sendMessage', 456, 'পিসি আনলক করা হয়েছে।']
+  ]);
+});
+
+test('wrong passcode deletes pending messages and never unlocks', async () => {
+  const calls = [];
+  const pendingUnlock = new Map([[456, {
+    promptMsgId: 90,
+    requestMsgId: 9,
+    timeout: setTimeout(() => {}, 60000)
+  }]]);
+  const bot = {
+    deleteMessage: async (...args) => calls.push(['deleteMessage', ...args]),
+    sendMessage: async (...args) => {
+      calls.push(['sendMessage', ...args]);
+      return { message_id: 91 };
+    }
+  };
+  const handled = await handlePendingUnlockMessage({
+    bot,
+    msg: { chat: { id: 456 }, message_id: 100, text: 'wrong' },
+    pendingUnlock,
+    verifier: createPasscodeVerifier('long-random-passcode'),
+    unlockPc: async () => { calls.push(['unlock']); }
+  });
+
+  assert.equal(handled, true);
+  assert.equal(pendingUnlock.has(456), false);
+  assert.deepEqual(calls, [
+    ['deleteMessage', 456, 100],
+    ['deleteMessage', 456, 90],
+    ['deleteMessage', 456, 9],
+    ['sendMessage', 456, 'ভুল পাসকোড।']
+  ]);
+});
+
+test('pending unlock expires after its timeout and removes the trigger and prompt', async () => {
+  const calls = [];
+  const pendingUnlock = new Map();
+  const bot = {
+    sendMessage: async () => ({ message_id: 90 }),
+    deleteMessage: async (...args) => calls.push(args)
+  };
+  await beginPcUnlock({
+    bot,
+    msg: { chat: { id: 456 }, message_id: 9 },
+    pendingUnlock,
+    timeoutMs: 5
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(pendingUnlock.has(456), false);
+  assert.deepEqual(calls, [[456, 90], [456, 9]]);
+});
+
+function fakeUnlockChild({ code = 0, stdout = '', stderr = '', error } = {}) {
+  const { EventEmitter } = require('node:events');
+  const { PassThrough } = require('node:stream');
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => {};
+  process.nextTick(() => {
+    if (stdout) child.stdout.write(stdout);
+    if (stderr) child.stderr.write(stderr);
+    child.stdout.end();
+    child.stderr.end();
+    if (error) child.emit('error', error);
+    else child.emit('close', code);
+  });
+  return child;
+}
+
+test('unlock_pc runs non-interactive sudo and reports success', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    (...args) => {
+      calls.push(args);
+      return fakeUnlockChild();
+    }
+  );
+
+  const result = await handlers.unlock_pc();
+
+  assert.deepEqual(calls, [[
+    '/usr/bin/sudo',
+    ['-n', '/usr/bin/loginctl', 'unlock-sessions'],
+    { stdio: ['ignore', 'pipe', 'pipe'] }
+  ]]);
+  assert.equal(result, 'পিসি আনলক করা হয়েছে।');
+});
+
+test('unlock_pc does not run loginctl unlock-sessions without sudo', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    (executable, args, options) => {
+      calls.push([executable, args, options]);
+      return fakeUnlockChild({
+        code: 1,
+        stderr: 'sudo: a password is required\n'
+      });
+    }
+  );
+  const logs = [];
+  const originalError = console.error;
+  console.error = (...args) => logs.push(args);
+  try {
+    assert.equal(await handlers.unlock_pc(), 'পিসি আনলক করা যায়নি।');
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.deepEqual(calls.map(([executable, args]) => [executable, args]), [
+    ['/usr/bin/sudo', ['-n', '/usr/bin/loginctl', 'unlock-sessions']],
+    ['/usr/bin/loginctl', ['list-sessions', '--no-legend']]
+  ]);
+  assert.equal(logs[0][1].stderr, 'sudo: a password is required\n');
+  assert.equal(logs[0][1].error, 'Process exited with code 1');
+  assert.equal(logs.some(([, details]) => details.command === '/usr/bin/loginctl unlock-sessions'), false);
+});
+
+test('unlock_pc finds and unlocks the active graphical session when unlock-sessions fails', async () => {
+  const calls = [];
+  const uid = String(process.getuid());
+  const outputs = [
+    { code: 1, stderr: 'sudo denied\n' },
+    { stdout: `7 ${uid} test-user seat0 tty2\n` },
+    { stdout: 'Active=yes\nType=wayland\nSeat=seat0\n' },
+    {}
+  ];
+  const handlers = createActionHandlers(
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    (executable, args) => {
+      calls.push([executable, args]);
+      return fakeUnlockChild(outputs.shift());
+    }
+  );
+  const logs = [];
+  const originalError = console.error;
+  console.error = (...args) => logs.push(args);
+  try {
+    assert.equal(await handlers.unlock_pc(), 'পিসি আনলক করা হয়েছে।');
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.deepEqual(calls, [
+    ['/usr/bin/sudo', ['-n', '/usr/bin/loginctl', 'unlock-sessions']],
+    ['/usr/bin/loginctl', ['list-sessions', '--no-legend']],
+    ['/usr/bin/loginctl', ['show-session', '7', '--property=Active', '--property=Type', '--property=Seat']],
+    ['/usr/bin/sudo', ['-n', '/usr/bin/loginctl', 'unlock-session', '7']]
+  ]);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0][1].stderr, 'sudo denied\n');
+});
+
+test('unlock_pc logs spawn errors and returns failure when no fallback succeeds', async () => {
+  const handlers = createActionHandlers(
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    () => fakeUnlockChild({ error: new Error('spawn unavailable') })
+  );
+  const logs = [];
+  const originalError = console.error;
+  console.error = (...args) => logs.push(args);
+  try {
+    assert.equal(await handlers.unlock_pc(), 'পিসি আনলক করা যায়নি।');
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.ok(logs.length >= 2);
+  assert.equal(logs[0][1].error, 'spawn unavailable');
 });
 
 test('play_youtube searches and opens the first video result, returning its exact title', async () => {
@@ -529,9 +782,16 @@ test('loadConfig requires the three configured values and a numeric user id', ()
     telegramToken: 'telegram-token',
     allowedUserId: '12345',
     openRouterApiKey: 'router-key',
+    unlockPasscode: '',
     browserAllowedDomains: ['youtube.com', 'xhamster.com', 'pornhub.com']
   });
   assert.throws(() => loadConfig({}), /Set TELEGRAM_BOT_TOKEN/);
+  assert.equal(loadConfig({
+    TELEGRAM_BOT_TOKEN: 'telegram-token',
+    ALLOWED_USER_ID: '12345',
+    OPENROUTER_API_KEY: 'router-key',
+    UNLOCK_PASSCODE: 'static-passcode'
+  }).unlockPasscode, 'static-passcode');
 });
 
 test('logProcessingError includes useful diagnostics without dumping the error object', () => {
@@ -582,6 +842,7 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
           assert.match(request.messages[0].content, /"ফুল স্কিন করো".*"fullscreen_on"/);
           assert.match(request.messages[0].content, /"ফুল স্কিন অফ করো".*"fullscreen_off"/);
           assert.match(request.messages[0].content, /"লাইক তুলে নাও".*"unlike"/);
+          assert.match(request.messages[0].content, /Never ask for or process an Ubuntu password or PC unlock passcode/);
           assert.match(request.messages[0].content, /ইউটিউব ট্যাব close করে দাও/);
           return {
             choices: [{

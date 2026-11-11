@@ -24,6 +24,7 @@ Set these values in `.env`:
 - `TELEGRAM_BOT_TOKEN`: your Telegram bot token
 - `ALLOWED_USER_ID`: your numeric Telegram user ID
 - `OPENROUTER_API_KEY`: your OpenRouter API key
+- `UNLOCK_PASSCODE`: optional static remote-unlock passcode; leave empty to disable remote unlock
 - `BROWSER_ALLOWED_DOMAINS`: comma-separated allowed hostnames; defaults to `youtube.com,xhamster.com,pornhub.com`. Use exact domains, not `*`.
 
 Keep `.env` private; it is excluded from Git. Start the bot with:
@@ -42,6 +43,8 @@ Transient OpenRouter and Telegram connection failures are retried up to three ti
 - “Open [URL]” opens an HTTP or HTTPS URL in a new Chrome tab.
 - “Close the [site] tab” (for example YouTube or Facebook) closes matching Chrome tabs by title or URL and confirms the count in Bengali.
 - “Lock the screen” runs `xdg-screensaver lock`.
+- Remote PC unlock is optional and uses the static `UNLOCK_PASSCODE` value in `.env`. Send “unlock pc” or “পিসি আনলক করো”, then send the passcode as the next message within 60 seconds. Use a long, unique passphrase and never reuse your Ubuntu password. The bot intercepts the exchange before AI processing and attempts to delete the passcode, prompt, and trigger messages before checking; these messages are never sent to OpenRouter. Deletion is best-effort and does not prevent Telegram from processing a message or showing notifications. Static passcodes are less secure than TOTP if exposed; protect `.env`, your Telegram account, and the bot token. Leave `UNLOCK_PASSCODE` empty to disable remote unlock.
+- To permit only these fixed unlock actions without a sudo password prompt, create a sudoers drop-in with `sudo visudo -f /etc/sudoers.d/telegram-pc-agent` and add `YOUR_LINUX_USER ALL=(root) NOPASSWD: /usr/bin/loginctl unlock-sessions, /usr/bin/loginctl unlock-session *`. Replace `YOUR_LINUX_USER` with the account running the bot. This grants that account permission to unlock sessions through the bot. If the unlock request cannot be deleted from Telegram, it is rejected.
 - “Mute/unmute volume” runs `amixer set Master toggle`.
 - “Set volume to [0–100]%” or “increase/decrease volume by [0–100]%” uses fixed `pactl` arguments and replies with the resulting level in Bengali. Relative changes are clamped to 0–100%.
 - Ask which applications are running for a Bengali summary of the top active processes, or request system stats for CPU, RAM, battery, and disk. These use fixed, read-only `run_bash` diagnostic actions and return command output to the AI for summarization.
