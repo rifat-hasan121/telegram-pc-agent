@@ -1,0 +1,598 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  createActionHandlers,
+  createPollingErrorLogger,
+  handleTextCommand,
+  loadConfig,
+  logProcessingError,
+  sendTelegramReply,
+  shellQuote
+} = require('../index');
+
+test('shellQuote safely escapes single quotes for shell commands', () => {
+  assert.equal(shellQuote("it's"), "'it'\\''s'");
+});
+
+test('play_youtube searches and opens the first video result, returning its exact title', async () => {
+  const calls = [];
+  const searches = [];
+  const handlers = createActionHandlers(
+    async (...args) => calls.push(args),
+    async (query) => {
+      searches.push(query);
+      return {
+        videos: [
+          { title: 'First exact video title', url: 'https://www.youtube.com/watch?v=first' },
+          { title: 'Second video', url: 'https://www.youtube.com/watch?v=second' }
+        ]
+      };
+    },
+    undefined,
+    undefined,
+    { openUrl: async (url) => {
+      calls.push(['openUrl', url]);
+      return 'Chrome-এ নতুন ট্যাব খোলা হয়েছে।';
+    } }
+  );
+
+  const result = await handlers.play_youtube({ query: 'cats & dogs' });
+
+  assert.deepEqual(searches, ['cats & dogs']);
+  assert.deepEqual(calls[0], ['openUrl', 'https://www.youtube.com/watch?v=first']);
+  assert.equal(result, 'YouTube-এ “First exact video title” চালানো হচ্ছে। Chrome-এ নতুন ট্যাব খোলা হয়েছে।');
+});
+
+test('play_youtube reports an empty search result without opening a browser', async () => {
+  const calls = [];
+  const originalError = console.error;
+  console.error = () => {};
+  const handlers = createActionHandlers(
+    async (...args) => calls.push(args),
+    async () => ({ videos: [] })
+  );
+
+  try {
+    await assert.rejects(handlers.play_youtube({ query: 'unknown video' }), /No YouTube video was found/);
+    assert.equal(calls.length, 0);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('browse_and_act passes the URL and goal to the browser agent', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    async () => {},
+    async () => ({ videos: [] }),
+    async (...args) => {
+      calls.push(args);
+      return 'Found and played the requested video.';
+    }
+  );
+
+  const reply = await handlers.browse_and_act({
+    url: 'https://youtube.com',
+    goal: 'Find the most viewed video and play it'
+  });
+
+  assert.deepEqual(calls, [['https://youtube.com', 'Find the most viewed video and play it']]);
+  assert.equal(reply, 'Found and played the requested video.');
+});
+
+test('set_volume uses fixed pactl arguments and replies in Bengali', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    async () => {},
+    async () => ({ videos: [] }),
+    undefined,
+    async (...args) => {
+      calls.push(args);
+      return { stdout: '', stderr: '' };
+    }
+  );
+
+  const reply = await handlers.set_volume({ operation: 'set', percentage: 50 });
+
+  assert.deepEqual(calls, [[
+    'pactl',
+    ['set-sink-volume', '@DEFAULT_SINK@', '50%'],
+    { timeout: 10000 }
+  ]]);
+  assert.equal(reply, 'ভলিউম 50% সেট করা হয়েছে।');
+});
+
+test('set_volume bounds relative volume changes between zero and one hundred', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    async () => {},
+    async () => ({ videos: [] }),
+    undefined,
+    async (...args) => {
+      calls.push(args);
+      if (args[1][0] === 'get-sink-volume') {
+        return { stdout: 'Volume: front-left: 65536 / 80% / 0.00 dB\n', stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    }
+  );
+
+  const reply = await handlers.set_volume({ operation: 'increase', percentage: 50 });
+
+  assert.deepEqual(calls.map(([program, args]) => [program, args]), [
+    ['pactl', ['get-sink-volume', '@DEFAULT_SINK@']],
+    ['pactl', ['set-sink-volume', '@DEFAULT_SINK@', '100%']]
+  ]);
+  assert.equal(reply, 'ভলিউম 100% বাড়ানো হয়েছে।');
+  await assert.rejects(handlers.set_volume({ operation: 'set', percentage: 101 }), /integer from 0 to 100/);
+  await assert.rejects(handlers.set_volume({ operation: 'reset', percentage: 50 }), /Unsupported volume operation/);
+});
+
+test('close_tab delegates the requested tab name to Chrome CDP', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    async () => {},
+    async () => ({ videos: [] }),
+    undefined,
+    undefined,
+    { closeTab: async (tabName) => {
+      calls.push(tabName);
+      return '“youtube” মেলে এমন 1টি Chrome ট্যাব বন্ধ করা হয়েছে।';
+    } }
+  );
+
+  const reply = await handlers.close_tab({ tabName: 'youtube' });
+
+  assert.deepEqual(calls, ['youtube']);
+  assert.equal(reply, '“youtube” মেলে এমন 1টি Chrome ট্যাব বন্ধ করা হয়েছে।');
+});
+
+test('close_browser closes only the known browser processes when requested completely', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    async () => {},
+    async () => ({ videos: [] }),
+    undefined,
+    async (...args) => {
+      calls.push(args);
+      return { stdout: '', stderr: '' };
+    }
+  );
+
+  const reply = await handlers.close_browser({ target: 'browser' });
+
+  assert.deepEqual(calls.map(([program, args]) => [program, args]), [
+    ['pkill', ['-x', 'chrome']],
+    ['pkill', ['-x', 'chromium']],
+    ['pkill', ['-x', 'firefox']]
+  ]);
+  assert.equal(reply, 'ব্রাউজার বন্ধ করা হয়েছে।');
+  await assert.rejects(handlers.close_browser({ target: 'youtube_tab' }), /Unsupported browser close target/);
+});
+
+test('open_url rejects non-web protocols without running a command', async () => {
+  const calls = [];
+  const originalError = console.error;
+  console.error = () => {};
+  const handlers = createActionHandlers(async (...args) => calls.push(args));
+
+  try {
+    await assert.rejects(handlers.open_url({ url: 'file:///etc/passwd' }), /Only HTTP and HTTPS/);
+    assert.equal(calls.length, 0);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('open_url opens a validated URL using the CDP controller', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    async () => {},
+    async () => ({ videos: [] }),
+    undefined,
+    undefined,
+    { openUrl: async (url) => {
+      calls.push(url);
+      return 'Chrome-এ নতুন ট্যাব খোলা হয়েছে।';
+    } }
+  );
+
+  const reply = await handlers.open_url({ url: 'https://example.com/a?q=hello%20world' });
+
+  assert.deepEqual(calls, ['https://example.com/a?q=hello%20world']);
+  assert.equal(reply, 'Chrome-এ নতুন ট্যাব খোলা হয়েছে।');
+});
+
+test('play_youtube logs browser opening errors and rethrows them for Telegram', async () => {
+  const calls = [];
+  const originalError = console.error;
+  console.error = (...args) => calls.push(args);
+  try {
+    const handlers = createActionHandlers(
+      async () => {},
+      async () => ({
+        videos: [{ title: 'Result', url: 'https://www.youtube.com/watch?v=video' }]
+      }),
+      undefined,
+      undefined,
+      { openUrl: async () => { throw new Error('Chrome could not open tab'); } }
+    );
+
+    await assert.rejects(handlers.play_youtube({ query: 'music' }), /Chrome could not open tab/);
+    assert.deepEqual(calls, [['play_youtube failed:', 'Chrome could not open tab']]);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('open_url logs failures and rethrows the original message for Telegram', async () => {
+  const calls = [];
+  const originalError = console.error;
+  console.error = (...args) => calls.push(args);
+  try {
+    const handlers = createActionHandlers(
+      async () => {},
+      async () => ({ videos: [] }),
+      undefined,
+      undefined,
+      { openUrl: async () => { throw new Error('Chrome could not open tab'); } }
+    );
+
+    await assert.rejects(handlers.open_url({ url: 'https://example.com' }), /Chrome could not open tab/);
+    assert.deepEqual(calls, [['open_url failed:', 'Chrome could not open tab']]);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('polling error logger logs EFATAL only once and logs the error message', () => {
+  const logged = [];
+  const logError = createPollingErrorLogger((...args) => logged.push(args));
+
+  logError({ code: 'EFATAL', message: 'Network dropped' });
+  logError({ code: 'EFATAL', message: 'Network dropped again' });
+  logError({ code: 'ETELEGRAM', message: 'Telegram API returned an error' });
+
+  assert.deepEqual(logged, [
+    ['Telegram polling error:', 'Network dropped'],
+    ['Telegram polling error:', 'Telegram API returned an error']
+  ]);
+});
+
+test('sendTelegramReply retries transient Telegram errors and then succeeds', async () => {
+  let attempts = 0;
+  await sendTelegramReply({
+    sendMessage: async () => {
+      attempts += 1;
+      if (attempts < 3) {
+        const error = new Error('EFATAL: AggregateError');
+        error.code = 'EFATAL';
+        throw error;
+      }
+      return true;
+    }
+  }, 123, 'উত্তর');
+
+  assert.equal(attempts, 3);
+});
+
+test('system_command allows only lock and mute commands', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(async (...args) => calls.push(args));
+
+  await handlers.system_command({ action: 'lock_screen' });
+  await handlers.system_command({ action: 'volume_mute' });
+  await assert.rejects(handlers.system_command({ action: 'reboot' }), /Unsupported system action/);
+
+  assert.deepEqual(calls.map(([command]) => command), [
+    'xdg-screensaver lock',
+    'amixer set Master toggle'
+  ]);
+});
+
+test('run_bash runs only fixed read-only diagnostics and returns stdout and stderr', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(async (...args) => {
+    calls.push(args);
+    return { stdout: 'running apps', stderr: 'diagnostic warning' };
+  });
+
+  const result = await handlers.run_bash({ action: 'list_running_apps' });
+
+  assert.deepEqual(calls, [[
+    `ps -u "$USER" -o comm= --sort=-%mem | awk '!seen[$0]++' | head -n 25`,
+    { timeout: 15000 }
+  ]]);
+  assert.deepEqual(result, {
+    stdout: 'running apps',
+    stderr: 'diagnostic warning',
+    exitCode: 0
+  });
+  await assert.rejects(
+    handlers.run_bash({ action: 'echo unsafe' }),
+    /Unsupported read-only diagnostic action/
+  );
+  assert.equal(calls.length, 1);
+});
+
+test('run_bash system stats uses a fixed command and includes command errors', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(async (...args) => {
+    calls.push(args);
+    const error = new Error('partial diagnostics');
+    error.stdout = 'CPU: 2%';
+    error.stderr = 'upower unavailable';
+    error.code = 1;
+    throw error;
+  });
+
+  const result = await handlers.run_bash({ action: 'system_stats' });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1].timeout, 15000);
+  assert.match(calls[0][0], /top -bn1/);
+  assert.match(calls[0][0], /free -h/);
+  assert.match(calls[0][0], /upower/);
+  assert.match(calls[0][0], /df -h \//);
+  assert.deepEqual(result, {
+    stdout: 'CPU: 2%',
+    stderr: 'upower unavailable',
+    exitCode: 1
+  });
+});
+
+test('take_screenshot captures with desktop environment, sends the image, and removes the temporary file', async () => {
+  const calls = [];
+  const removed = [];
+  const bot = {
+    sendPhoto: async (...args) => calls.push(['sendPhoto', ...args])
+  };
+  const handlers = createActionHandlers(
+    async (...args) => {
+      calls.push(['exec', ...args]);
+      return { stdout: '', stderr: '' };
+    },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { bot, chatId: 456 },
+    {
+      existsSync: (filePath) => filePath === '/tmp/screenshot_1234.png',
+      unlinkSync: (filePath) => removed.push(filePath)
+    },
+    '/home/test-user',
+    () => 1234
+  );
+
+  const reply = await handlers.take_screenshot({});
+
+  assert.equal(calls[0][0], 'exec');
+  assert.equal(calls[0][1], 'gnome-screenshot -f "/tmp/screenshot_1234.png"');
+  assert.equal(calls[0][2].timeout, 15000);
+  assert.equal(calls[0][2].env.DISPLAY, process.env.DISPLAY);
+  assert.equal(calls[0][2].env.WAYLAND_DISPLAY, process.env.WAYLAND_DISPLAY);
+  assert.deepEqual(calls[1], ['sendPhoto', 456, '/tmp/screenshot_1234.png']);
+  assert.deepEqual(removed, ['/tmp/screenshot_1234.png']);
+  assert.equal(reply, 'স্ক্রিনশটটি Telegram-এ পাঠানো হয়েছে।');
+});
+
+test('take_screenshot removes the temporary file when Telegram photo delivery fails', async () => {
+  const removed = [];
+  const handlers = createActionHandlers(
+    async () => {},
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { bot: { sendPhoto: async () => { throw new Error('Telegram upload failed'); } }, chatId: 456 },
+    {
+      existsSync: () => true,
+      unlinkSync: (filePath) => removed.push(filePath)
+    },
+    '/home/test-user',
+    () => 1234
+  );
+
+  await assert.rejects(handlers.take_screenshot({}), /Telegram upload failed/);
+  assert.deepEqual(removed, ['/tmp/screenshot_1234.png']);
+});
+
+test('take_screenshot removes a partial temporary file when capture fails', async () => {
+  const removed = [];
+  const handlers = createActionHandlers(
+    async () => { throw new Error('gnome-screenshot failed'); },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { bot: { sendPhoto: async () => assert.fail('Must not send a failed capture') }, chatId: 456 },
+    {
+      existsSync: () => true,
+      unlinkSync: (filePath) => removed.push(filePath)
+    },
+    '/home/test-user',
+    () => 1234
+  );
+
+  await assert.rejects(handlers.take_screenshot({}), /gnome-screenshot failed/);
+  assert.deepEqual(removed, ['/tmp/screenshot_1234.png']);
+});
+
+test('send_file resolves home paths, sends existing files, and reports missing paths in Bengali', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {
+      bot: { sendDocument: async (...args) => calls.push(args) },
+      chatId: 456
+    },
+    {
+      existsSync: (filePath) => filePath === '/home/test-user/Downloads/test.pdf',
+      statSync: () => ({ isFile: () => true })
+    },
+    '/home/test-user'
+  );
+
+  const reply = await handlers.send_file({ filePath: '~/Downloads/test.pdf' });
+  assert.deepEqual(calls, [[456, '/home/test-user/Downloads/test.pdf']]);
+  assert.equal(reply, 'ফাইলটি Telegram-এ পাঠানো হয়েছে।');
+
+  const missing = await handlers.send_file({ filePath: 'Documents/missing.pdf' });
+  assert.match(missing, /ফাইলটি পাওয়া যায়নি/);
+  assert.match(missing, /\/home\/test-user\/Documents\/missing\.pdf/);
+  assert.equal(calls.length, 1);
+});
+
+test('loadConfig requires the three configured values and a numeric user id', () => {
+  assert.deepEqual(loadConfig({
+    TELEGRAM_BOT_TOKEN: 'telegram-token',
+    ALLOWED_USER_ID: '12345',
+    OPENROUTER_API_KEY: 'router-key'
+  }), {
+    telegramToken: 'telegram-token',
+    allowedUserId: '12345',
+    openRouterApiKey: 'router-key',
+    browserAllowedDomains: ['youtube.com', 'xhamster.com', 'pornhub.com']
+  });
+  assert.throws(() => loadConfig({}), /Set TELEGRAM_BOT_TOKEN/);
+});
+
+test('logProcessingError includes useful diagnostics without dumping the error object', () => {
+  const originalError = console.error;
+  let logged;
+  console.error = (...args) => { logged = args; };
+  try {
+    const error = new Error('Invalid API key');
+    error.status = 401;
+    error.code = 'auth_error';
+    error.apiKey = 'must-not-be-logged';
+
+    logProcessingError('OpenRouter request', error);
+
+    assert.equal(logged[0], 'Authorized message OpenRouter request failed:');
+    assert.deepEqual(logged[1], {
+      name: 'Error',
+      message: 'Invalid API key',
+      status: 401,
+      code: 'auth_error'
+    });
+    assert.doesNotMatch(JSON.stringify(logged), /must-not-be-logged/);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('handleTextCommand executes the model-selected allowlisted tool', async () => {
+  const openai = {
+    chat: {
+      completions: {
+        create: async (request) => {
+          assert.equal(request.model, 'google/gemini-2.5-flash');
+          assert.equal(request.max_tokens, 1000);
+          assert.equal(request.tools.length, 10);
+          assert.equal(request.messages[0].role, 'system');
+          assert.match(request.messages[0].content, /both Bengali and English/);
+          assert.match(request.messages[0].content, /do not ask any clarifying questions/);
+          assert.match(request.messages[0].content, /requests for information or lists directly/);
+          assert.match(request.messages[0].content, /call browse_and_act/);
+          assert.match(request.messages[0].content, /call close_tab/);
+          assert.match(request.messages[0].content, /run_bash with action "list_running_apps"/);
+          assert.match(request.messages[0].content, /never request arbitrary shell commands/);
+          assert.match(request.messages[0].content, /"স্ক্রিনশট পাঠাও".*call take_screenshot/);
+          assert.match(request.messages[0].content, /"আমার X ফাইলটা পাঠাও".*call send_file/);
+          assert.match(request.messages[0].content, /ইউটিউব ট্যাব close করে দাও/);
+          return {
+            choices: [{
+              message: {
+                tool_calls: [{
+                  function: { name: 'system_command', arguments: '{"action":"lock_screen"}' }
+                }]
+              }
+            }]
+          };
+        }
+      }
+    }
+  };
+  const calls = [];
+  const handlers = createActionHandlers(async (command) => calls.push(command));
+
+  const reply = await handleTextCommand(openai, 'Lock my screen', handlers);
+
+  assert.deepEqual(calls, ['xdg-screensaver lock']);
+  assert.equal(reply, 'Locked the screen.');
+});
+
+test('handleTextCommand passes diagnostic stdout and stderr to the model for Bengali summary', async () => {
+  const requests = [];
+  const toolCall = {
+    id: 'diagnostics-1',
+    type: 'function',
+    function: {
+      name: 'run_bash',
+      arguments: '{"action":"list_running_apps"}'
+    }
+  };
+  const openai = {
+    chat: {
+      completions: {
+        create: async (request) => {
+          requests.push(request);
+          if (requests.length === 1) {
+            return { choices: [{ message: { role: 'assistant', tool_calls: [toolCall] } }] };
+          }
+          return {
+            choices: [{
+              message: { content: 'চালু থাকা অ্যাপ: Firefox ও Telegram।' }
+            }]
+          };
+        }
+      }
+    }
+  };
+  const handlers = createActionHandlers(async () => ({
+    stdout: 'firefox\ntelegram',
+    stderr: ''
+  }));
+
+  const reply = await handleTextCommand(openai, 'আমার চালু অ্যাপগুলো কী?', handlers);
+
+  assert.equal(reply, 'চালু থাকা অ্যাপ: Firefox ও Telegram।');
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].messages.at(-1).role, 'tool');
+  assert.deepEqual(JSON.parse(requests[1].messages.at(-1).content), {
+    stdout: 'firefox\ntelegram',
+    stderr: '',
+    exitCode: 0
+  });
+  assert.equal(requests[1].tools, undefined);
+});
+
+test('handleTextCommand returns a direct AI answer without executing a tool', async () => {
+  const openai = {
+    chat: {
+      completions: {
+        create: async () => ({
+          choices: [{
+            message: {
+              content: 'এখানে কয়েকটি জনপ্রিয় গানের নাম দেওয়া হলো।',
+              tool_calls: []
+            }
+          }]
+        })
+      }
+    }
+  };
+  const calls = [];
+  const handlers = createActionHandlers(async (command) => calls.push(command));
+
+  const reply = await handleTextCommand(openai, 'কি গান আছে তার ১০টা লিস্ট দাও', handlers);
+
+  assert.equal(reply, 'এখানে কয়েকটি জনপ্রিয় গানের নাম দেওয়া হলো।');
+  assert.deepEqual(calls, []);
+});

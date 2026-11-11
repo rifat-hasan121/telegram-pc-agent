@@ -1,0 +1,21 @@
+{
+  "name": "telegram-pc-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Control an Ubuntu PC from Telegram using OpenRouter.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "node-telegram-bot-api": "^0.66.0",
+    "openai": "^4.77.0",
+    "playwright": "^1.56.1",
+    "yt-search": "^2.13.1"
+  }
+}
