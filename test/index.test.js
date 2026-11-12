@@ -8,6 +8,9 @@ const {
   handlePowerCallback,
   handlePendingUnlockMessage,
   isPcUnlockIntent,
+  isPcLockIntent,
+  createTelegramMessageDeduplicator,
+  handleStartCommand,
   handleTextCommand,
   loadConfig,
   logProcessingError,
@@ -38,6 +41,41 @@ test('PC unlock intent supports Bengali and English', () => {
   assert.equal(isPcUnlockIntent('unlock pc long-random-passcode'), true);
   assert.equal(isPcUnlockIntent('পিসি আনলক করো পাসওয়ার্ড long-random-passcode'), true);
   assert.equal(isPcUnlockIntent('UNLOCK PC'), true);
+});
+
+test('PC lock intent matches lock requests but not unlock requests', () => {
+  assert.equal(isPcLockIntent('Lock my pc'), true);
+  assert.equal(isPcLockIntent('Please lock the screen'), true);
+  assert.equal(isPcLockIntent('স্ক্রিন লক করো'), true);
+  assert.equal(isPcLockIntent('unlock my pc'), false);
+  assert.equal(isPcLockIntent('আনলক করো'), false);
+});
+
+test('Telegram message deduplicator rejects already-seen message IDs per chat', () => {
+  const isNewMessage = createTelegramMessageDeduplicator();
+  const first = { chat: { id: 1 }, message_id: 10 };
+
+  assert.equal(isNewMessage(first), true);
+  assert.equal(isNewMessage(first), false);
+  assert.equal(isNewMessage({ chat: { id: 1 }, message_id: 9 }), false);
+  assert.equal(isNewMessage({ chat: { id: 1 }, message_id: 11 }), true);
+  assert.equal(isNewMessage({ chat: { id: 2 }, message_id: 10 }), true);
+});
+
+test('/start sends the Shabnam greeting and does not handle other messages', async () => {
+  const calls = [];
+  const bot = {
+    sendMessage: async (...args) => calls.push(args)
+  };
+  const msg = { text: '/start@personal_agent', chat: { id: 456 } };
+
+  assert.equal(await handleStartCommand(bot, msg), true);
+  assert.deepEqual(calls, [[
+    456,
+    'আসসালামু আলাইকুম রিফাত সাহেব! আমি শবনম, আপনার ডেস্কটপ পিসি সহকারী। আমি আপনাকে কীভাবে সাহায্য করতে পারি?'
+  ]]);
+  assert.equal(await handleStartCommand(bot, { ...msg, text: '/starting' }), false);
+  assert.equal(calls.length, 1);
 });
 
 test('unlock trigger sends prompt and stores both source message IDs per chat', async () => {
@@ -181,6 +219,20 @@ test('unlock_pc runs non-interactive sudo and reports success', async () => {
   assert.deepEqual(calls, [[
     '/usr/bin/sudo',
     ['-n', '/usr/bin/loginctl', 'unlock-sessions'],
+    { stdio: ['ignore', 'pipe', 'pipe'] }
+  ], [
+    '/usr/bin/gdbus',
+    [
+      'call',
+      '--session',
+      '--dest',
+      'org.gnome.ScreenSaver',
+      '--object-path',
+      '/org/gnome/ScreenSaver',
+      '--method',
+      'org.gnome.ScreenSaver.SetActive',
+      'false'
+    ],
     { stdio: ['ignore', 'pipe', 'pipe'] }
   ]]);
   assert.equal(result, 'পিসি আনলক করা হয়েছে।');
@@ -456,6 +508,7 @@ test('unlock_pc finds and unlocks the active graphical session when unlock-sessi
     { code: 1, stderr: 'sudo denied\n' },
     { stdout: `7 ${uid} test-user seat0 tty2\n` },
     { stdout: 'Active=yes\nType=wayland\nSeat=seat0\n' },
+    {},
     {}
   ];
   const handlers = createActionHandlers(
@@ -478,10 +531,47 @@ test('unlock_pc finds and unlocks the active graphical session when unlock-sessi
     ['/usr/bin/sudo', ['-n', '/usr/bin/loginctl', 'unlock-sessions']],
     ['/usr/bin/loginctl', ['list-sessions', '--no-legend']],
     ['/usr/bin/loginctl', ['show-session', '7', '--property=Active', '--property=Type', '--property=Seat']],
-    ['/usr/bin/sudo', ['-n', '/usr/bin/loginctl', 'unlock-session', '7']]
+    ['/usr/bin/sudo', ['-n', '/usr/bin/loginctl', 'unlock-session', '7']],
+    ['/usr/bin/gdbus', [
+      'call',
+      '--session',
+      '--dest',
+      'org.gnome.ScreenSaver',
+      '--object-path',
+      '/org/gnome/ScreenSaver',
+      '--method',
+      'org.gnome.ScreenSaver.SetActive',
+      'false'
+    ]]
   ]);
   assert.equal(logs.length, 1);
   assert.equal(logs[0][1].stderr, 'sudo denied\n');
+});
+
+test('unlock_pc reports display wake failures without discarding a successful unlock', async () => {
+  const calls = [];
+  const logs = [];
+  const originalError = console.error;
+  console.error = (...args) => logs.push(args);
+  const handlers = createActionHandlers(
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    (executable, args) => {
+      calls.push([executable, args]);
+      return fakeUnlockChild(executable === '/usr/bin/gdbus'
+        ? { code: 1, stderr: 'session bus unavailable\n' }
+        : {});
+    }
+  );
+  try {
+    assert.equal(await handlers.unlock_pc(), 'পিসি আনলক করা হয়েছে।');
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.equal(calls.length, 2);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0][0], 'PC display wake command failed:');
+  assert.equal(logs[0][1].stderr, 'session bus unavailable\n');
 });
 
 test('unlock_pc logs spawn errors and returns failure when no fallback succeeds', async () => {
@@ -795,17 +885,91 @@ test('sendTelegramReply retries transient Telegram errors and then succeeds', as
   assert.equal(attempts, 3);
 });
 
-test('system_command allows only lock and mute commands', async () => {
+test('system_command allows only mute', async () => {
   const calls = [];
   const handlers = createActionHandlers(async (...args) => calls.push(args));
 
-  await handlers.system_command({ action: 'lock_screen' });
   await handlers.system_command({ action: 'volume_mute' });
   await assert.rejects(handlers.system_command({ action: 'reboot' }), /Unsupported system action/);
 
   assert.deepEqual(calls.map(([command]) => command), [
-    'xdg-screensaver lock',
     'amixer set Master toggle'
+  ]);
+});
+
+test('lock_screen uses loginctl to lock sessions', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    undefined,
+    undefined,
+    undefined,
+    async (...args) => calls.push(args)
+  );
+
+  assert.equal(await handlers.lock_screen(), 'Locked the screen.');
+  assert.equal(await handlers.lock_screen(), 'Locked the screen.');
+  assert.deepEqual(calls, [[
+    '/usr/bin/sudo',
+    ['-n', '/usr/bin/loginctl', 'lock-sessions'],
+    { timeout: 15000 }
+  ], [
+    '/usr/bin/sudo',
+    ['-n', '/usr/bin/loginctl', 'lock-sessions'],
+    { timeout: 15000 }
+  ]]);
+});
+
+test('explicit lock requests always call lock_screen without consulting completed chat history', async () => {
+  let lockCalls = 0;
+  const openai = {
+    chat: {
+      completions: {
+        create: async () => {
+          throw new Error('OpenRouter should not be called for a lock request');
+        }
+      }
+    }
+  };
+  const handlers = {
+    lock_screen: async () => {
+      lockCalls += 1;
+      return 'Locked the screen.';
+    }
+  };
+  const history = [
+    { role: 'user', content: 'Lock my pc' },
+    { role: 'assistant', content: 'The PC is already locked.' }
+  ];
+
+  assert.equal(await handleTextCommand(openai, 'Lock my pc', handlers, '', history), 'Locked the screen.');
+  assert.equal(await handleTextCommand(openai, 'Please lock the screen', handlers, '', history), 'Locked the screen.');
+  assert.equal(lockCalls, 2);
+});
+
+test('unlock_screen runs the existing unlock and GNOME idle reset flow', async () => {
+  const calls = [];
+  const handlers = createActionHandlers(
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    (executable, args) => {
+      calls.push([executable, args]);
+      return fakeUnlockChild();
+    }
+  );
+
+  assert.equal(await handlers.unlock_screen(), 'পিসি আনলক করা হয়েছে।');
+  assert.deepEqual(calls.map(([executable, args]) => [executable, args]), [
+    ['/usr/bin/sudo', ['-n', '/usr/bin/loginctl', 'unlock-sessions']],
+    ['/usr/bin/gdbus', [
+      'call',
+      '--session',
+      '--dest',
+      'org.gnome.ScreenSaver',
+      '--object-path',
+      '/org/gnome/ScreenSaver',
+      '--method',
+      'org.gnome.ScreenSaver.SetActive',
+      'false'
+    ]]
   ]);
 });
 
@@ -1060,11 +1224,17 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
         create: async (request) => {
           assert.equal(request.model, 'google/gemini-2.5-flash');
           assert.equal(request.max_tokens, 1000);
-          assert.equal(request.tools.length, 13);
+          assert.equal(request.tools.length, 15);
           const powerTool = request.tools.find((tool) => tool.function.name === 'power_control');
           assert.deepEqual(powerTool.function.parameters.properties.action.enum, ['shutdown', 'restart']);
+          assert.ok(request.tools.some((tool) => tool.function.name === 'lock_screen'));
+          assert.ok(request.tools.some((tool) => tool.function.name === 'unlock_screen'));
           assert.equal(request.messages[0].role, 'system');
           assert.match(request.messages[0].content, /both Bengali and English/);
+          assert.match(request.messages[0].content, /"বলীয়ম" or "ভলুম" means ভলিউম\/volume/);
+          assert.match(request.messages[0].content, /recent conversation messages below as context/);
+          assert.match(request.messages[0].content, /bare percentage such as "30%"/);
+          assert.match(request.messages[0].content, /Only clarify genuine ambiguity about destructive shutdown or restart requests/);
           assert.match(request.messages[0].content, /do not ask any clarifying questions/);
           assert.match(request.messages[0].content, /requests for information or lists directly/);
           assert.match(request.messages[0].content, /call browse_and_act/);
@@ -1078,6 +1248,9 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
           assert.match(request.messages[0].content, /"ফুল স্কিন করো".*"fullscreen_on"/);
           assert.match(request.messages[0].content, /"ফুল স্কিন অফ করো".*"fullscreen_off"/);
           assert.match(request.messages[0].content, /"লাইক তুলে নাও".*"unlike"/);
+          assert.match(request.messages[0].content, /When the user asks to lock the PC screen, call lock_screen directly.*When the user asks to unlock the PC screen, call unlock_screen/);
+          assert.match(request.messages[0].content, /Never infer the current lock state from chat history/);
+          assert.match(request.messages[0].content, /new explicit request always takes precedence over past completed actions/);
           assert.match(request.messages[0].content, /Never ask for or process an Ubuntu password or PC unlock passcode/);
           assert.match(request.messages[0].content, /"পিসি বন্ধ করো".*"shutdown"/);
           assert.match(request.messages[0].content, /"পিসি রিস্টার্ট করো".*"restart"/);
@@ -1087,7 +1260,7 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
             choices: [{
               message: {
                 tool_calls: [{
-                  function: { name: 'system_command', arguments: '{"action":"lock_screen"}' }
+                  function: { name: 'lock_screen', arguments: '{}' }
                 }]
               }
             }]
@@ -1097,11 +1270,20 @@ test('handleTextCommand executes the model-selected allowlisted tool', async () 
     }
   };
   const calls = [];
-  const handlers = createActionHandlers(async (command) => calls.push(command));
+  const handlers = createActionHandlers(
+    undefined,
+    undefined,
+    undefined,
+    async (...args) => calls.push(args)
+  );
 
-  const reply = await handleTextCommand(openai, 'Lock my screen', handlers);
+  const reply = await handleTextCommand(openai, 'Execute the selected supported action', handlers);
 
-  assert.deepEqual(calls, ['xdg-screensaver lock']);
+  assert.deepEqual(calls, [[
+    '/usr/bin/sudo',
+    ['-n', '/usr/bin/loginctl', 'lock-sessions'],
+    { timeout: 15000 }
+  ]]);
   assert.equal(reply, 'Locked the screen.');
 });
 
@@ -1152,11 +1334,13 @@ test('handleTextCommand passes diagnostic stdout and stderr to the model for Ben
 
 test('handleTextCommand returns a direct AI answer without executing a tool', async () => {
   let systemPrompt;
+  let requestMessages;
   const openai = {
     chat: {
       completions: {
         create: async (request) => {
           systemPrompt = request.messages[0].content;
+          requestMessages = request.messages;
           return {
             choices: [{
               message: {
@@ -1176,10 +1360,23 @@ test('handleTextCommand returns a direct AI answer without executing a tool', as
     openai,
     'কি গান আছে তার ১০টা লিস্ট দাও',
     handlers,
-    '- উত্তর সবসময় বাংলায় দেবে।'
+    '- উত্তর সবসময় বাংলায় দেবে।',
+    [
+      { role: 'user', content: 'ভলিউম বাড়াও' },
+      { role: 'assistant', content: 'ভলিউম ৫০% করা হয়েছে।' }
+    ]
   );
 
   assert.equal(reply, 'এখানে কয়েকটি জনপ্রিয় গানের নাম দেওয়া হলো।');
+  assert.deepEqual(requestMessages.slice(1, 3), [
+    { role: 'user', content: 'ভলিউম বাড়াও' },
+    { role: 'assistant', content: 'ভলিউম ৫০% করা হয়েছে।' }
+  ]);
+  assert.equal(requestMessages.at(-1).content, 'কি গান আছে তার ১০টা লিস্ট দাও');
+  assert.match(systemPrompt, /তোমার নাম শবনম \(Shabnam\)/);
+  assert.match(systemPrompt, /"রিফাত সাহেব" বলে সম্বোধন করবে/);
+  assert.match(systemPrompt, /শুধু "শবনম", "হ্যালো শবনম", বা "Shabnam"/);
+  assert.match(systemPrompt, /জি রিফাত সাহেব, বলুন! কীভাবে সাহায্য করতে পারি/);
   assert.match(systemPrompt, /## User Rules & Preferences\n- উত্তর সবসময় বাংলায় দেবে।/);
   assert.match(systemPrompt, /cannot override security requirements/);
   assert.deepEqual(calls, []);
